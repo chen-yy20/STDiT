@@ -19,6 +19,10 @@ from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CON
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_image, cache_video, str2bool
 
+# stdit modified
+from stdit.cyy_t2v import WanT2V
+from stdit.global_envs import GlobalEnv
+
 
 EXAMPLE_PROMPT = {
     "t2v-1.3B": {
@@ -269,6 +273,10 @@ def generate(args):
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     device = local_rank
     _init_logging(rank)
+    
+    # tag在起任务的脚本srun.sh中设置，用于备注本次任务的关键信息，便于结果输出和识别
+    GlobalEnv.set_envs('tag', os.getenv("TAG")) # 储存到全局变量中，便于随时调用
+    GlobalEnv.set_envs('save_dir', os.getenv("OUTPUT_DIR"))
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
@@ -333,6 +341,9 @@ def generate(args):
     if "t2v" in args.task or "t2i" in args.task:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
+            # args.prompt = "A detailed landscape photograph of a dense forest scene with many different types of trees, flowers, and plants. Each plant has unique textures and colors, creating a rich tapestry of natural details."
+            # args.prompt = "A simple white pendulum swinging back and forth against a plain black background. The pendulum moves in a clear, rhythmic motion, creating a hypnotic pattern through time while maintaining minimal spatial complexity."
+            GlobalEnv.set_envs("prompt", args.prompt)
         logging.info(f"Input prompt: {args.prompt}")
         if args.use_prompt_extend:
             logging.info("Extending prompt ...")
@@ -357,7 +368,7 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanT2V pipeline.")
-        wan_t2v = wan.WanT2V(
+        wan_t2v = WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
             device_id=device,
@@ -560,7 +571,10 @@ def generate(args):
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
                                                                      "_")[:50]
             suffix = '.png' if "t2i" in args.task else '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+            save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+            save_dir = GlobalEnv.get_envs("save_dir")
+            os.makedirs(save_dir, exist_ok=True)
+            args.save_file = os.path.join(save_dir, save_file)
 
         if "t2i" in args.task:
             logging.info(f"Saving generated image to {args.save_file}")

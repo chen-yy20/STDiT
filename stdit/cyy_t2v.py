@@ -14,16 +14,18 @@ import torch.cuda.amp as amp
 import torch.distributed as dist
 from tqdm import tqdm
 
-from .distributed.fsdp import shard_model
-from .modules.model import WanModel
-from .modules.t5 import T5EncoderModel
-from .modules.vae import WanVAE
-from .utils.fm_solvers import (
+from wan.distributed.fsdp import shard_model
+from wan.modules.model import WanModel
+from wan.modules.t5 import T5EncoderModel
+from wan.modules.vae import WanVAE
+from wan.utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
     retrieve_timesteps,
 )
-from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+from .dynamic_analyzer import DynamicAnalyzer
 
 
 class WanT2V:
@@ -90,7 +92,7 @@ class WanT2V:
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
 
-            from .distributed.xdit_context_parallel import (
+            from ..wan.distributed.xdit_context_parallel import (
                 usp_attn_forward,
                 usp_dit_forward,
             )
@@ -197,6 +199,16 @@ class WanT2V:
         @contextmanager
         def noop_no_sync():
             yield
+            
+        # analyzer 初始化
+        analyzer = DynamicAnalyzer(
+            C = target_shape[0],
+            T = target_shape[1],
+            H = target_shape[2],
+            W = target_shape[3],
+            block_size=(3,4,4),
+            analysis_steps=6
+        )
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
 
@@ -233,7 +245,7 @@ class WanT2V:
             for step, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
-
+                
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
@@ -244,6 +256,9 @@ class WanT2V:
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
+                
+                # Analyze feature
+                analyzer.step(noise_pred, step)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),

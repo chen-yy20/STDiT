@@ -24,7 +24,8 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-
+# from .train_free_utils import make_ar1_noise, temporal_align_step
+import numpy as np
 
 class WanT2V:
 
@@ -149,7 +150,7 @@ class WanT2V:
 
         Returns:
             torch.Tensor:
-                Generated video frames tensor. Dimensions: (C, N H, W) where:
+                Generated video frames tensor. Dimensions: (C, N, H, W) where:
                 - C: Color channels (3 for RGB)
                 - N: Number of frames (81)
                 - H: Frame height (from size)
@@ -194,11 +195,21 @@ class WanT2V:
                 generator=seed_g)
         ]
 
+
+
+
+
+
         @contextmanager
         def noop_no_sync():
             yield
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+        epsilon = getattr(self, "tr_epsilon", 0.8)   # 对通道做L2后的阈值，可按实际分布调
+        warmup_steps = getattr(self, "tr_warmup", 10) # 用前 6 步做判定(对应 timestep=0..5)
+        frame_diffs_hist = []     # 每步一个 (T-1,H,W) tensor
+        reuse_mask_frames = None  # (T-1,H,W)；True=该帧该像素点与f=0足够接近，可复用
+        mask_ready = False
 
         # evaluation mode
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
@@ -227,10 +238,31 @@ class WanT2V:
             # sample videos
             latents = noise
 
+
+            xa, ya = 5, 5
+            xb, yb = 5, 6 
+            xc, yc= 30, 21
+            all_steps_AB_L2 = []   # [num_steps, F]，每步每帧的 |A-B|_2
+            all_steps_AB_vec = []  # 每步保存 [F, C] 的向量差（如需）
+            #latents_init = latents.detach().clone()
+            A0 = latents[0][10, :, ya, xa]  # [F]
+            B0 = latents[0][10, :, yb, xb]  # [F]
+            C0=latents[0][10, :, yc, xc]
+            A_steps = [] 
+            B_steps = []
+            C_steps = []
+            #print('init_0:',A0.shape())
+      
+
+
+
+
+
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
+            ref_frame = 0
 
-            for step, t in enumerate(tqdm(timesteps)):
+            for step_idx, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
@@ -244,6 +276,53 @@ class WanT2V:
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
+                A_point=noise_pred[10,:,ya,xa]
+                A_steps.append(A_point.detach().cpu().numpy())
+                B_point=noise_pred[10,:,yb,xb]
+                B_steps.append(B_point.detach().cpu().numpy())
+                C_point=noise_pred[10,:,yc,xc]
+                C_steps.append(C_point.detach().cpu().numpy())
+
+                
+                if step_idx == 0:
+                    ref0 = noise_pred[:, ref_frame:ref_frame+1, :, :]                # (C,1,H,W)
+                    # expand到全部帧后与各帧做差，得到 (C,T,H,W)，其中第0帧差为0
+                    offset_t0_full = ref0.expand(-1, noise_pred.size(1), -1, -1) - noise_pred
+                    offset_t0_full = offset_t0_full.detach()
+
+
+                if not mask_ready:
+                    # 当前步的 "帧内 vs f=0" 差：对通道维做 L2
+                    # noise_pred[:, 1:, :, :] - noise_pred[:, 0:1, :, :] -> (C, T-1, H, W)
+                    cur_frame_diff = (noise_pred[:, 1:, :, :] - noise_pred[:, 0:1, :, :]) \
+                            .pow(2).sum(dim=0).sqrt()  # (T-1, H, W)
+                    frame_diffs_hist.append(cur_frame_diff.detach())
+
+                    if len(frame_diffs_hist) == warmup_steps:
+                        # 逐元素取 k=0..warmup_steps-1 的最大差 -> (T-1,H,W)
+                        max_diff_over_warmup = torch.stack(frame_diffs_hist, dim=0).amax(dim=0)  # (T-1,H,W)
+                        # 判定逐帧复用掩码：True 表示“该帧该点在 warmup 内始终接近 f=0”
+                        offset_mag_t0 = offset_t0_full.pow(2).sum(dim=0).sqrt() 
+                        second_order_gap = (max_diff_over_warmup - offset_mag_t0[1:]).abs() 
+                        reuse_mask_frames = (second_order_gap <= float(epsilon)).to(noise_pred.device)
+
+                        reuse_mask_frames[ref_frame, :, :] = False
+                        mask_ready = True
+                        # 可选：保存以便可视化
+                        torch.save(reuse_mask_frames.cpu(), "temporal_reuse_mask_frames_ep08.pt")
+                        torch.save(second_order_gap.cpu(), "second_order_gap.pt")
+
+                if mask_ready and step_idx<40 and step_idx>10:
+                        # 按你的公式：noise_x = noise_y + (noise_y0 - noise_x0)，y=ref_frame
+                        ref_now = noise_pred[:, ref_frame:ref_frame+1, :, :].expand_as(offset_t0_full)  # (C,T,H,W)
+                        reused_full = ref_now - offset_t0_full                                         # (C,T,H,W)
+
+                        mask = reuse_mask_frames.unsqueeze(0)   # (1,T,H,W) -> 广播到C
+                        noise_pred[:, 1:, :, :] = torch.where(
+                                mask,
+                                reused_full[:, 1:, :, :],    # 与 noise_pred 的切片同样是 20 帧
+                                noise_pred[:, 1:, :, :]
+                                )
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -251,15 +330,42 @@ class WanT2V:
                     latents[0].unsqueeze(0),
                     return_dict=False,
                     generator=seed_g)[0]
+
                 latents = [temp_x0.squeeze(0)]
+                print("latents.shape =", latents[0].shape)
 
             x0 = latents
+            A_final=x0[0][10,:,ya,xa]
+            B_final=x0[0][10,:,yb,xb]
+            C_final=x0[0][10,:,yc,xc]
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
             if self.rank == 0:
                 videos = self.vae.decode(x0)
+        A_steps = np.stack(A_steps, axis=0)
+        A0 = A0.cpu().numpy()
+        B_steps = np.stack(B_steps, axis=0)
+        B0 = B0.cpu().numpy()
+        C_steps = np.stack(C_steps, axis=0)
+        C0 = C0.cpu().numpy()
+        B_final = B_final.cpu().numpy()
+        A_final = A_final.cpu().numpy()
+        C_final = C_final.cpu().numpy()
+        np.savez("AB_points_noise_pred_56_channel10.npz",
+         A_final=A_final,
+         B_final=B_final,
+         C_final=C_final,
+         A_steps=A_steps,
+         B_steps=B_steps,
+         C_steps=C_steps,
+         A0=A0,
+         B0=B0,
+         C0=C0)
 
+        print("保存完成: AB_points_noise_pred_56.npz")
+        print("A_steps.shape =", A_steps.shape, " B_steps.shape =", B_steps.shape)
+        print("A0.shape =", A0.shape, " B0.shape =", B0.shape)    
         del noise, latents
         del sample_scheduler
         if offload_model:
@@ -267,5 +373,5 @@ class WanT2V:
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
-
+        print("video.shape =", videos[0].shape)
         return videos[0] if self.rank == 0 else None
