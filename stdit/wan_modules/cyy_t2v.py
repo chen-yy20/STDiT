@@ -15,7 +15,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from wan.distributed.fsdp import shard_model
-from wan.modules.model import WanModel
+# from wan.modules.model import WanModel
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae import WanVAE
 from wan.utils.fm_solvers import (
@@ -25,7 +25,11 @@ from wan.utils.fm_solvers import (
 )
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
-from .dynamic_analyzer import DynamicAnalyzer
+# ================= modified =====================
+from ..dynamic_analyzer import DynamicAnalyzer
+from ..utils import split_latents_chunks, merge_latents_chunks
+from ..global_envs import GlobalEnv
+from .models import WanModel
 
 
 class WanT2V:
@@ -92,7 +96,7 @@ class WanT2V:
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
 
-            from ..wan.distributed.xdit_context_parallel import (
+            from ...wan.distributed.xdit_context_parallel import (
                 usp_attn_forward,
                 usp_dit_forward,
             )
@@ -201,14 +205,20 @@ class WanT2V:
             yield
             
         # analyzer 初始化
+        cut_block_size = GlobalEnv.get_envs("cut_block_size")
+        analyze_block_size = GlobalEnv.get_envs("analyze_block_size")
+        
         analyzer = DynamicAnalyzer(
             C = target_shape[0],
             T = target_shape[1],
             H = target_shape[2],
             W = target_shape[3],
-            block_size=(3,4,4),
+            block_size=analyze_block_size,
             analysis_steps=6
         )
+        t_block_cnt = target_shape[1] // cut_block_size[0]
+        h_block_cnt = target_shape[2] // cut_block_size[1]
+        w_block_cnt = target_shape[3] // cut_block_size[2]
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
 
@@ -243,19 +253,41 @@ class WanT2V:
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
             for step, t in enumerate(tqdm(timesteps)):
-                latent_model_input = latents
+                
+                if GlobalEnv.get_envs("cut"):
+                    latent_chunks, chunk_info = split_latents_chunks(
+                        latents[0], 
+                        temporal_chunks=t_block_cnt, 
+                        height_chunks=h_block_cnt,
+                        width_chunks=w_block_cnt,
+                    )
+                    
+                    latent_model_input = [latent.squeeze(0) for latent in latent_chunks]
+                    print(f"After cut: {len(latent_model_input)=}, {latent_model_input[0].shape=}")
+                else:
+                    latent_model_input = latents
+                    
                 timestep = [t]
                 
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-
+                noise_pred_cond_list = self.model(
+                    latent_model_input, t=timestep, **arg_c)
+                noise_pred_uncond_list = self.model(
+                    latent_model_input, t=timestep, **arg_null)
+                
+                if GlobalEnv.get_envs("cut"):
+                    # Merge chunks
+                    noise_pred_cond = merge_latents_chunks(noise_pred_cond_list, chunk_info)
+                    noise_pred_uncond = merge_latents_chunks(noise_pred_uncond_list, chunk_info)
+                else:
+                    noise_pred_cond = noise_pred_cond_list[0]
+                    noise_pred_uncond = noise_pred_uncond_list[0]
+                    
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
+                
                 
                 # Analyze feature
                 analyzer.step(noise_pred, step)

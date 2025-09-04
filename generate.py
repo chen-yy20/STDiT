@@ -20,8 +20,9 @@ from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_image, cache_video, str2bool
 
 # stdit modified
-from stdit.cyy_t2v import WanT2V
+from stdit.wan_modules.cyy_t2v import WanT2V
 from stdit.global_envs import GlobalEnv
+from stdit.timer import init_timer, print_time_statistics
 
 
 EXAMPLE_PROMPT = {
@@ -277,6 +278,11 @@ def generate(args):
     # tag在起任务的脚本srun.sh中设置，用于备注本次任务的关键信息，便于结果输出和识别
     GlobalEnv.set_envs('tag', os.getenv("TAG")) # 储存到全局变量中，便于随时调用
     GlobalEnv.set_envs('save_dir', os.getenv("OUTPUT_DIR"))
+    GlobalEnv.set_envs('cut', False) # 切分为batch维度的块
+    GlobalEnv.set_envs('cut_block_size', (7,20,26)) # 一个块的大小：目前的块不能够是奇数，因为embedding cnn的步长为偶数，会导致卷积出来少一步。
+    GlobalEnv.set_envs('analyze_block_size', (3,4,4)) # 分析的粒度
+    
+    init_timer()
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
@@ -593,6 +599,8 @@ def generate(args):
                 nrow=1,
                 normalize=True,
                 value_range=(-1, 1))
+            
+    print_time_statistics()
     logging.info("Finished.")
 
 
